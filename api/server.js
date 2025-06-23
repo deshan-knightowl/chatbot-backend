@@ -4,7 +4,7 @@ import OpenAI from "openai";
 import { Pinecone } from "@pinecone-database/pinecone";
 import dotenv from "dotenv";
 
-dotenv.config();
+dotenv.config(); 
 
 const app = express();
 const { json } = pkg;
