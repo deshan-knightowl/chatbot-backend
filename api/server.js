@@ -20,14 +20,14 @@ const pinecone = new Pinecone({
 
 const index = pinecone.index(process.env.PINECONE_INDEX_NAME);
 
-// ✅ FIX: Ensure metadata is stored in Pinecone
-app.post("/embed", async (req, res) => {
-  console.log("Request received");
-  console.log(req.body);
+function normalizeText(text) {
+  return text.trim().toLowerCase(); // case-insensitive match
+}
 
+// --- EMBED ENDPOINT ---
+app.post("/embed", async (req, res) => {
   const texts = req.body;
 
-  // Ensure the input is an array of objects with a "text" field
   if (
     !Array.isArray(texts) ||
     !texts.every((item) => item.text && typeof item.text === "string")
@@ -41,44 +41,36 @@ app.post("/embed", async (req, res) => {
   try {
     const embeddings = [];
 
-    // Iterate over each text item and generate its embedding
     for (const { text } of texts) {
+      const normalizedText = normalizeText(text);
+
       const response = await openai.embeddings.create({
         model: "text-embedding-3-small",
-        input: text,
-        dimensions: 512, // Ensure the dimensions match your model
+        input: normalizedText,
+        dimensions: 512,
       });
-
-      console.log("Embedding response:", response);
 
       const embedding = response.data[0].embedding;
 
-      // Store the embedding along with metadata
       await index.upsert([
         {
-          id: `text-${Date.now()}`,
+          id: `text-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           values: embedding,
-          metadata: { text }, // Store metadata for each text
+          metadata: { text: normalizedText }, // store normalized
         },
       ]);
 
-      embeddings.push({ text, embedding }); // Collect embeddings for response
+      embeddings.push({ text: normalizedText, embedding });
     }
 
-    res
-      .status(200)
-      .send({ message: "Texts embedded successfully", embeddings });
+    res.status(200).send({ message: "Texts embedded successfully", embeddings });
   } catch (error) {
     console.error("Error in /embed:", error);
     res.status(500).send({ error: error.message });
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("Hello, World!");
-});
-
-// ✅ FIX: Ensure query retrieves stored context
+// --- CHAT ENDPOINT ---
 app.post("/chat", async (req, res) => {
   const { query } = req.body;
 
@@ -87,72 +79,53 @@ app.post("/chat", async (req, res) => {
   }
 
   try {
-    // Generate embedding for query
+    const normalizedQuery = normalizeText(query);
+
     const embeddingResponse = await openai.embeddings.create({
-      model: "text-embedding-3-small", // match model
-      input: [query],
+      model: "text-embedding-3-small",
+      input: [normalizedQuery],
       dimensions: 512,
     });
 
     const embedding = embeddingResponse.data[0].embedding;
 
-    // Query Pinecone for similar embeddings
     const pineconeResponse = await index.query({
       vector: embedding,
       topK: 5,
       includeValues: false,
-      includeMetadata: true, // ✅ Ensure metadata is retrieved
+      includeMetadata: true,
     });
 
-    console.log(
-      "Pinecone Query Response:",
-      JSON.stringify(pineconeResponse, null, 2)
-    );
+    const contextMatches = pineconeResponse.matches
+      .filter((match) => match.score > 0.7) // Filter by match threshold
+      .map((match) => match.metadata?.text)
+      .filter(Boolean);
 
-    if (!pineconeResponse.matches || pineconeResponse.matches.length === 0) {
-      return res.status(200).json({ response: "No relevant context found." });
-    }
+    const context = contextMatches.join("\n");
 
-    // ✅ FIX: Ensure metadata extraction is correct
-    const context = pineconeResponse.matches
-      .map((match) => match.metadata?.text) // Extract stored text
-      .filter(Boolean) // Remove empty values
-      .join("\n");
+    const basePrompt = `Context:\n${context || "None found"}\n\nQuestion: ${query}`;
 
-    if (!context) {
-      return res.status(200).json({
-        response: "I can only answer questions related to this website only.",
-      });
-    }
-
-    // Create structured messages
     const messages = [
       {
         role: "system",
         content:
-          "You are the AI chatbot of this website. Only answer based on the provided company knowledge and context. If you don't know the answer, reply with: 'I can only answer questions related to this website.'",
+          "You are the AI chatbot of this website. Only answer based on the provided company knowledge and context. If unsure, still try to help using any relevant context retrieved.",
       },
       {
         role: "user",
-        content: `Context: ${context}\n\nQuestion: ${query}`,
+        content: basePrompt,
       },
     ];
 
-    // Call OpenAI to generate a response
     const chatResponse = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages,
     });
 
-    if (!chatResponse.choices || chatResponse.choices.length === 0) {
-      return res
-        .status(500)
-        .json({ error: "OpenAI returned an empty response" });
-    }
+    const reply = chatResponse.choices?.[0]?.message?.content?.trim();
 
-    // Return AI-generated response
     res.status(200).json({
-      response: chatResponse.choices[0].message.content,
+      response: reply || "Sorry, no appropriate response could be generated.",
     });
   } catch (error) {
     console.error("Error in /chat:", error);
@@ -162,9 +135,11 @@ app.post("/chat", async (req, res) => {
   }
 });
 
+app.get("/", (req, res) => {
+  res.send("Hello, World!");
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
-
- 
