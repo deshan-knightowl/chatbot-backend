@@ -4,7 +4,7 @@ import OpenAI from "openai";
 import { Pinecone } from "@pinecone-database/pinecone";
 import dotenv from "dotenv";
 
-dotenv.config(); 
+dotenv.config();
 
 const app = express();
 const { json } = pkg;
@@ -20,14 +20,14 @@ const pinecone = new Pinecone({
 
 const index = pinecone.index(process.env.PINECONE_INDEX_NAME);
 
-function normalizeText(text) {
-  return text.trim().toLowerCase(); // case-insensitive match
-}
-
-// --- EMBED ENDPOINT ---
+// ✅ FIX: Ensure metadata is stored in Pinecone
 app.post("/embed", async (req, res) => {
+  console.log("Request received");
+  console.log(req.body);
+
   const texts = req.body;
 
+  // Ensure the input is an array of objects with a "text" field
   if (
     !Array.isArray(texts) ||
     !texts.every((item) => item.text && typeof item.text === "string")
@@ -41,91 +41,127 @@ app.post("/embed", async (req, res) => {
   try {
     const embeddings = [];
 
+    // Iterate over each text item and generate its embedding
     for (const { text } of texts) {
-      const normalizedText = normalizeText(text);
-
       const response = await openai.embeddings.create({
         model: "text-embedding-3-small",
-        input: normalizedText,
-        dimensions: 512,
+        input: text,
+        dimensions: 512, // Ensure the dimensions match your model
       });
+
+      console.log("Embedding response:", response);
 
       const embedding = response.data[0].embedding;
 
+      // Store the embedding along with metadata
       await index.upsert([
         {
-          id: `text-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          id: `text-${Date.now()}`,
           values: embedding,
-          metadata: { text: normalizedText }, // store normalized
+          metadata: { text }, // Store metadata for each text
         },
       ]);
 
-      embeddings.push({ text: normalizedText, embedding });
+      embeddings.push({ text, embedding }); // Collect embeddings for response
     }
 
-    res.status(200).send({ message: "Texts embedded successfully", embeddings });
+    res
+      .status(200)
+      .send({ message: "Texts embedded successfully", embeddings });
   } catch (error) {
     console.error("Error in /embed:", error);
     res.status(500).send({ error: error.message });
   }
 });
 
-// --- CHAT ENDPOINT ---
+app.get("/", (req, res) => {
+  res.send("Hello, World!");
+});
+
+// ✅ FIX: Ensure query retrieves stored context
 app.post("/chat", async (req, res) => {
-  const { query } = req.body;
+  let { query } = req.body;
+
+  if (!query || typeof query !== "string") {
+    return res.status(400).json({ error: "Invalid query input" });
+  }
+
+  // Normalize the query
+  query = query.trim().replace(/\?+$/, ""); // Remove trailing question marks
+
 
   if (!query || typeof query !== "string") {
     return res.status(400).json({ error: "Invalid query input" });
   }
 
   try {
-    const normalizedQuery = normalizeText(query);
-
+    // Generate embedding for query
     const embeddingResponse = await openai.embeddings.create({
-      model: "text-embedding-3-small",
-      input: [normalizedQuery],
+      model: "text-embedding-3-small", // match model
+      input: [query],
       dimensions: 512,
     });
 
     const embedding = embeddingResponse.data[0].embedding;
 
+    // Query Pinecone for similar embeddings
     const pineconeResponse = await index.query({
       vector: embedding,
       topK: 5,
       includeValues: false,
-      includeMetadata: true,
+      includeMetadata: true, // ✅ Ensure metadata is retrieved
     });
 
-    const contextMatches = pineconeResponse.matches
-      .filter((match) => match.score > 0.7) // Filter by match threshold
-      .map((match) => match.metadata?.text)
-      .filter(Boolean);
+    console.log(
+      "Pinecone Query Response:",
+      JSON.stringify(pineconeResponse, null, 2)
+    );
 
-    const context = contextMatches.join("\n");
+    if (!pineconeResponse.matches || pineconeResponse.matches.length === 0) {
+      return res.status(200).json({ response: "No relevant context found." });
+    }
 
-    const basePrompt = `Context:\n${context || "None found"}\n\nQuestion: ${query}`;
+    // ✅ FIX: Ensure metadata extraction is correct
+    const context = pineconeResponse.matches
+      .map((match) => match.metadata?.text) // Extract stored text
+      .filter(Boolean) // Remove empty values
+      .join("\n");
 
+    if (!context) {
+      return res.status(200).json({
+        response: "I can only answer questions related to this website only.",
+      });
+    }
+
+    // Create structured messages
     const messages = [
       {
         role: "system",
         content:
-          "You are the AI chatbot of this website. Only answer based on the provided company knowledge and context. If unsure, still try to help using any relevant context retrieved.",
+          "You are the helpful AI chatbot of a website. You must answer questions strictly using the given CONTEXT. Do not use any external knowledge. If the answer isn't in the context, respond: 'I can only answer questions related to this website.'",
       },
       {
         role: "user",
-        content: basePrompt,
+        content: `CONTEXT:\n${context}\n\nQUESTION:\n${query}`,
       },
     ];
 
+
+    // Call OpenAI to generate a response
     const chatResponse = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages,
     });
 
-    const reply = chatResponse.choices?.[0]?.message?.content?.trim();
+    if (!chatResponse.choices || chatResponse.choices.length === 0) {
+      return res
+        .status(500)
+        .json({ error: "OpenAI returned an empty response" });
+    }
 
+    // Return AI-generated response
     res.status(200).json({
-      response: reply || "Sorry, no appropriate response could be generated.",
+      response: chatResponse.choices[0].message.content,
     });
   } catch (error) {
     console.error("Error in /chat:", error);
@@ -133,10 +169,6 @@ app.post("/chat", async (req, res) => {
       error: error.message || "An error occurred while processing your request",
     });
   }
-});
-
-app.get("/", (req, res) => {
-  res.send("Hello, World!");
 });
 
 const PORT = process.env.PORT || 3001;
