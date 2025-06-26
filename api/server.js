@@ -5,7 +5,7 @@ import { Pinecone } from "@pinecone-database/pinecone";
 import dotenv from "dotenv";
 import { randomUUID } from "crypto";
 
-dotenv.config();
+dotenv.config(); 
 
 const app = express();
 const { json } = pkg;
